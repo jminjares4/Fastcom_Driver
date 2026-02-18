@@ -135,6 +135,9 @@ int fastcom_setup(fastcom_t dev, const fastcom_config_t *cfg)
                 (FASTCOM_FS_OFFSET(cfg->frame_sync_tx_offset_leading) << 4) |
                 (FASTCOM_FS_OFFSET(cfg->frame_sync_tx_offset_trailing) << 8);
 
+    /* DPLLR (PDF p95) – DPLL reset count */
+    regs.DPLLR = cfg->dpll_enable ? 4 : 4;   /* default 32 clocks (4 × 8) */
+
     /* Remaining registers */
     regs.BGR = (cfg->baud_rate > 0) ? (50000000UL / cfg->baud_rate) - 1 : 0;
     regs.SSR = cfg->sync_sequence;   regs.SMR = cfg->sync_mask;
