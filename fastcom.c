@@ -1,11 +1,13 @@
 /*
  * fastcom.c
  * COMPLETE USER-SPACE DRIVER FOR FASTCOM FSCC / SuperFSCC FAMILY
- * 100% coverage of the 112-page PDF (rev 1.8, 11/12/2024)
- * Bug-free & SuperFSCC/4-PCIe ready
+ * Properly handles sync_fd / data_fd / ctrl_fd separation
+ * Runtime mode switching between sync and async/UART
+ * No dependency on fscc_enable_async=1 at load time
  */
 
 #include "fastcom.h"
+#include "fastcom_defs.h"
 #include "calculate-clock-bits.h"
 #include <fcntl.h>
 #include <unistd.h>
@@ -15,259 +17,241 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <serialfc.h>
 
 struct fastcom_handle {
-    int fscc_fd;          /* /dev/fsccN */
-    int data_fd;          /* ttyS for async mode */
-    int port_number;
-    bool append_status;
-    bool append_timestamp;
+    int port;
+    fastcom_mode_t mode;
+    int sync_fd;       // always /dev/fscc# — for FCR, purge, status
+    int data_fd;       // active read/write: fscc# (sync) or ttyS# (async)
+    int ctrl_fd;       // /dev/serialfc# — async extras only
 };
 
-/* FCR HELPER MACROS (PDF p102-103) */
-#define FASTCOM_FCR_RECHO(p)   (1u << ( 8 + 4*(p)))
-#define FASTCOM_FCR_TC485(p)   (1u << ( 9 + 4*(p)))
-#define FASTCOM_FCR_TD485(p)   (1u << (10 + 4*(p)))
-#define FASTCOM_FCR_UART(p)    (1u << (24 + (p)))
+static int tty_number_for_port(int port) {
+    // Typical Commtech mapping — verify with dmesg | grep ttyS
+    // port 0 → ttyS4, port 1 → ttyS5, etc.
+    return 4 + port;
+}
 
-fastcom_t fastcom_open(int port_number)
-{
-    struct fastcom_handle *h = calloc(1, sizeof(*h));
+fastcom_t fastcom_open(int port, fastcom_mode_t initial_mode) {
+    if (port < 0 || port > 3) return NULL;
+
+    fastcom_t h = calloc(1, sizeof(*h));
     if (!h) return NULL;
 
-    char path[32];
-    sprintf(path, "/dev/fscc%d", port_number);
-    h->fscc_fd = open(path, O_RDWR);
-    if (h->fscc_fd < 0) { free(h); return NULL; }
+    h->port = port;
+    h->mode = initial_mode;
+    h->sync_fd = h->data_fd = h->ctrl_fd = -1;
 
-    h->port_number = port_number;
-    h->data_fd = -1;
+    char path[64];
+
+    // Always open sync_fd — needed for mode control
+    sprintf(path, "/dev/fscc%d", port);
+    h->sync_fd = open(path, O_RDWR);
+    if (h->sync_fd < 0) {
+        perror("open /dev/fscc#");
+        goto fail;
+    }
+
+    // Set initial data path
+    if (initial_mode == FASTCOM_MODE_ASYNC_UART) {
+        sprintf(path, "/dev/ttyS%d", tty_number_for_port(port));
+        h->data_fd = open(path, O_RDWR | O_NOCTTY);
+        if (h->data_fd < 0) goto fail;
+
+        sprintf(path, "/dev/serialfc%d", port);
+        h->ctrl_fd = open(path, O_RDWR);
+        if (h->ctrl_fd < 0) goto fail;
+
+        // Ensure UART mode is active
+        fastcom_set_mode(h, FASTCOM_MODE_ASYNC_UART);
+    } else {
+        h->data_fd = h->sync_fd;
+    }
+
     return h;
+
+fail:
+    fastcom_close(h);
+    return NULL;
 }
 
-int fastcom_setup(fastcom_t dev, const fastcom_config_t *cfg)
-{
-    if (!dev || !cfg) return -1;
+int fastcom_set_mode(fastcom_t h, fastcom_mode_t new_mode) {
+    if (!h || h->mode == new_mode) return 0;
 
-    struct fscc_registers regs;
-    FSCC_REGISTERS_INIT(regs);
-    ioctl(dev->fscc_fd, FSCC_GET_REGISTERS, &regs);
+    char path[64];
 
-    /* FCR – Feature Control Register (PDF p102) */
-    uint32_t fcr = (uint32_t)regs.FCR;
-    int p = dev->port_number % 4;
-
-    if (cfg->physical == FASTCOM_PHYS_RS485) {
-        fcr |= FASTCOM_FCR_RECHO(p) | FASTCOM_FCR_TC485(p) | FASTCOM_FCR_TD485(p);
-    } else {
-        fcr &= ~(FASTCOM_FCR_RECHO(p) | FASTCOM_FCR_TC485(p) | FASTCOM_FCR_TD485(p));
+    // Close current async fds if switching away
+    if (h->mode == FASTCOM_MODE_ASYNC_UART) {
+        if (h->data_fd >= 0 && h->data_fd != h->sync_fd) close(h->data_fd);
+        if (h->ctrl_fd >= 0) close(h->ctrl_fd);
+        h->data_fd = -1;
+        h->ctrl_fd = -1;
     }
 
-    if (cfg->mode == FASTCOM_MODE_ASYNC_UART) {
-        fcr |= FASTCOM_FCR_UART(p);
-        regs.FCR = fcr;
-        ioctl(dev->fscc_fd, FSCC_SET_REGISTERS, &regs);
+    // Update FCR via sync_fd
+    __u32 uart_bit = (h->port == 0) ? 0x01000000UL : 0x02000000UL;
+    struct fscc_registers regs = { .FCR = FSCC_UPDATE_VALUE };
 
-        char tty[32]; sprintf(tty, "/dev/ttyS%d", dev->port_number);
-        dev->data_fd = open(tty, O_RDWR | O_NOCTTY);
-        if (dev->data_fd < 0) return -1;
+    if (ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs) < 0) {
+        perror("GET FCR");
+        return -1;
+    }
 
+    if (new_mode == FASTCOM_MODE_ASYNC_UART) {
+        regs.FCR |= uart_bit;
+    } else {
+        regs.FCR &= ~uart_bit;
+    }
+
+    if (ioctl(h->sync_fd, FSCC_SET_REGISTERS, &regs) < 0) {
+        perror("SET FCR");
+        return -1;
+    }
+
+    // Purge after mode change
+    ioctl(h->sync_fd, FSCC_PURGE_RX);
+    ioctl(h->sync_fd, FSCC_PURGE_TX);
+    usleep(20000);
+
+    // Open new path if going async
+    if (new_mode == FASTCOM_MODE_ASYNC_UART) {
+        sprintf(path, "/dev/ttyS%d", tty_number_for_port(h->port));
+        h->data_fd = open(path, O_RDWR | O_NOCTTY);
+        if (h->data_fd < 0) {
+            perror("open ttyS#");
+            return -1;
+        }
+
+        sprintf(path, "/dev/serialfc%d", h->port);
+        h->ctrl_fd = open(path, O_RDWR);
+        if (h->ctrl_fd < 0) {
+            close(h->data_fd);
+            h->data_fd = -1;
+            perror("open serialfc#");
+            return -1;
+        }
+    } else {
+        h->data_fd = h->sync_fd;
+    }
+
+    h->mode = new_mode;
+    return 0;
+}
+
+int fastcom_set_config(fastcom_t h, const fastcom_config_t *cfg) {
+    if (!h || !cfg) return -EINVAL;
+
+    if (h->mode == FASTCOM_MODE_ASYNC_UART) {
         struct termios tio;
-        tcgetattr(dev->data_fd, &tio);
+        if (tcgetattr(h->data_fd, &tio) < 0) return -1;
+
         cfmakeraw(&tio);
-        tio.c_cflag = (cfg->data_bits == 8 ? CS8 : CS7) | CREAD | CLOCAL;
-        if (cfg->parity == FASTCOM_PARITY_EVEN) tio.c_cflag |= PARENB;
+        tio.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE);
+        tio.c_cflag |= CREAD | CLOCAL;
+
+        switch (cfg->data_bits) {
+            case 5: tio.c_cflag |= CS5; break;
+            case 6: tio.c_cflag |= CS6; break;
+            case 7: tio.c_cflag |= CS7; break;
+            default: tio.c_cflag |= CS8; break;
+        }
+
         if (cfg->parity == FASTCOM_PARITY_ODD)  tio.c_cflag |= PARENB | PARODD;
+        if (cfg->parity == FASTCOM_PARITY_EVEN) tio.c_cflag |= PARENB;
         if (cfg->stop_bits == FASTCOM_STOP_BITS_2) tio.c_cflag |= CSTOPB;
-        tcsetattr(dev->data_fd, TCSANOW, &tio);
+
+        speed_t baud = B9600;
+        if (cfg->baud_rate == 1000000) baud = B1000000;
+        else if (cfg->baud_rate == 115200) baud = B115200;
+        cfsetispeed(&tio, baud);
+        cfsetospeed(&tio, baud);
+
+        if (tcsetattr(h->data_fd, TCSANOW, &tio) < 0) return -1;
+
+        if (cfg->strobe_per_byte) {
+            ioctl(h->ctrl_fd, IOCTL_FASTCOM_SET_FRAME_LENGTH, 1);
+        }
+        if (cfg->aux_clock_hz > 0) {
+            unsigned char bits[20];
+            if (calculate_clock_bits(cfg->aux_clock_hz, 10, bits) == 0) {
+                ioctl(h->ctrl_fd, IOCTL_FASTCOM_SET_CLOCK_BITS, bits);
+            }
+        }
     } else {
-        regs.FCR = fcr;
-        ioctl(dev->fscc_fd, FSCC_SET_REGISTERS, &regs);
-        dev->data_fd = dev->fscc_fd;
+        struct fscc_registers regs = {0};
+        regs.CCR0 = FSCC_UPDATE_VALUE;
+        if (ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs) < 0) return -1;
+
+        regs.CCR0 &= ~0x03;
+        switch (cfg->mode) {
+            case FASTCOM_MODE_HDLC:       regs.CCR0 |= 0x00; break;
+            case FASTCOM_MODE_XSYNC:      regs.CCR0 |= 0x01; break;
+            case FASTCOM_MODE_TRANSPARENT: regs.CCR0 |= 0x02; break;
+            default: break;
+        }
+
+        if (cfg->baud_rate > 0) {
+            unsigned char bits[20];
+            if (calculate_clock_bits(cfg->baud_rate, 10, bits) == 0) {
+                ioctl(h->sync_fd, FSCC_SET_CLOCK_BITS, bits);
+            }
+        }
+
+        if (cfg->strobe_per_byte && cfg->mode == FASTCOM_MODE_TRANSPARENT) {
+            regs.CCR0 = (regs.CCR0 & ~(0x7u << 8)) | (FASTCOM_FSC_MODE5_TX_ENABLE << 8);
+        }
+
+        if (ioctl(h->sync_fd, FSCC_SET_REGISTERS, &regs) < 0) return -1;
+
+        fastcom_purge(h, true, true);
     }
 
-    /* Clock synthesizer (PDF p35) */
-    if (cfg->external_clock_hz) {
-        unsigned char bits[20];
-        if (calculate_clock_bits(cfg->external_clock_hz, 10, bits) == 0)
-            ioctl(dev->fscc_fd, FSCC_SET_CLOCK_BITS, bits);
-    }
-
-    FSCC_REGISTERS_INIT(regs);
-
-    /* CCR0 (PDF p71-72) – Mode 5 correctly in bits 10:8 */
-    uint32_t fsc_mode = cfg->use_tx_frame_sync ? FASTCOM_FSC_MODE5_TX_ENABLE : cfg->frame_sync_mode;
-
-    regs.CCR0 = cfg->mode |
-                (cfg->clock_mode << 2) |
-                cfg->encoding |
-                cfg->crc |
-                (cfg->shared_flag ? FASTCOM_CCR0_SFLAG : 0) |
-                (cfg->interframe_fill ? FASTCOM_CCR0_ITF : 0) |
-                (cfg->bit_order == FASTCOM_BIT_ORDER_MSB_FIRST ? FASTCOM_CCR0_OBT : 0) |
-                (cfg->vis ? FASTCOM_CCR0_VIS : 0) |
-                (cfg->recd ? FASTCOM_CCR0_RECD : 0) |
-                FASTCOM_NSB(cfg->num_sync_bytes) |
-                FASTCOM_NTB(cfg->num_term_bytes) |
-                (fsc_mode << 8);
-
-    /* CCR1 (PDF p75-78) – exact polarities */
-    regs.CCR1 = (cfg->zero_bit_insertion ? FASTCOM_CCR1_ZINS : 0) |
-                (cfg->one_bit_insertion ? FASTCOM_CCR1_OINS : 0) |
-                (cfg->dps ? FASTCOM_CCR1_DPS : 0) |
-                (cfg->dsync ? FASTCOM_CCR1_DSYNC : 0) |
-                (cfg->dterm ? FASTCOM_CCR1_DTERM : 0) |
-                (cfg->dtcrc ? FASTCOM_CCR1_DTCRC : 0) |
-                (cfg->drcrc ? FASTCOM_CCR1_DRCRC : 0) |
-                (cfg->crcr ? FASTCOM_CCR1_CRCR : 0) |
-                (cfg->invert_data ? (FASTCOM_CCR1_RDP | FASTCOM_CCR1_TDP) : 0) |
-                (cfg->invert_clock ? (FASTCOM_CCR1_RCP | FASTCOM_CCR1_TCP) : 0) |
-                (cfg->dsr_active_high ? FASTCOM_CCR1_DSRP : 0) |
-                (cfg->fsr_active_high ? FASTCOM_CCR1_FSRP : 0) |
-                (cfg->fst_active_high ? FASTCOM_CCR1_FSTP : 0) |
-                (cfg->manual_rts ? FASTCOM_CCR1_RTSC : 0) |
-                (cfg->rts_asserted ? FASTCOM_CCR1_RTS : 0) |
-                (cfg->dtr_asserted ? FASTCOM_CCR1_DTR : 0);
-
-    /* CCR2 (PDF p79) – only RLC + offsets */
-    regs.CCR2 = ((uint32_t)cfg->receive_length_check << 16) |
-                FASTCOM_FS_OFFSET(cfg->frame_sync_rx_offset) |
-                (FASTCOM_FS_OFFSET(cfg->frame_sync_tx_offset_leading) << 4) |
-                (FASTCOM_FS_OFFSET(cfg->frame_sync_tx_offset_trailing) << 8);
-
-    /* DPLLR (PDF p95) – DPLL reset count */
-    regs.DPLLR = cfg->dpll_enable ? 4 : 4;   /* default 32 clocks (4 × 8) */
-
-    /* Remaining registers */
-    regs.BGR = (cfg->baud_rate > 0) ? (50000000UL / cfg->baud_rate) - 1 : 0;
-    regs.SSR = cfg->sync_sequence;   regs.SMR = cfg->sync_mask;
-    regs.TSR = cfg->termination_sequence; regs.TMR = cfg->termination_mask;
-    regs.RAR = cfg->receive_address;  regs.RAMR = cfg->receive_address_mask;
-    regs.PPR = ((uint32_t)cfg->preamble_length << 24) | ((uint32_t)cfg->preamble << 16) |
-               ((uint32_t)cfg->postamble_length << 8) | cfg->postamble;
-    regs.TCR = cfg->timer_control;
-
-    ioctl(dev->fscc_fd, FSCC_SET_REGISTERS, &regs);
-
-    /* High-level features (PDF §3) */
-    ioctl(dev->fscc_fd, cfg->append_status ? FSCC_ENABLE_APPEND_STATUS : FSCC_DISABLE_APPEND_STATUS);
-    ioctl(dev->fscc_fd, cfg->append_timestamp ? FSCC_ENABLE_APPEND_TIMESTAMP : FSCC_DISABLE_APPEND_TIMESTAMP);
-    ioctl(dev->fscc_fd, cfg->rx_multiple_frames ? FSCC_ENABLE_RX_MULTIPLE : FSCC_DISABLE_RX_MULTIPLE);
-    ioctl(dev->fscc_fd, FSCC_SET_TX_MODIFIERS, cfg->tx_modifiers);
-
-    if (cfg->input_buffer_frames || cfg->output_buffer_frames) {
-        struct fscc_memory_cap cap = { cfg->input_buffer_frames, cfg->output_buffer_frames };
-        ioctl(dev->fscc_fd, FSCC_SET_MEMORY_CAP, &cap);
-    }
-
-    dev->append_status = cfg->append_status;
-    dev->append_timestamp = cfg->append_timestamp;
     return 0;
 }
 
-/* Basic I/O */
-ssize_t fastcom_write(fastcom_t dev, const void *buf, size_t len) { return write(dev->data_fd, buf, len); }
-ssize_t fastcom_read(fastcom_t dev, void *buf, size_t len) { return read(dev->data_fd, buf, len); }
-
-/* Read one complete frame */
-ssize_t fastcom_read_one_frame(fastcom_t dev, void *payload_buf, size_t payload_buf_size,
-                               uint64_t *timestamp_out, uint16_t *status_out)
-{
-    uint8_t raw[16384];
-    ssize_t n = read(dev->data_fd, raw, sizeof(raw));
-    if (n <= 0) return n;
-
-    size_t extra = (dev->append_timestamp ? 8 : 0) + (dev->append_status ? 2 : 0);
-    if (n < extra) return -EIO;
-
-    size_t payload_len = n - extra;
-    if (payload_len > payload_buf_size) return -ENOBUFS;
-
-    memcpy(payload_buf, raw, payload_len);
-    size_t off = payload_len;
-    if (timestamp_out && dev->append_timestamp) { memcpy(timestamp_out, raw + off, 8); off += 8; }
-    if (status_out && dev->append_status) memcpy(status_out, raw + off, 2);
-
-    return payload_len;
+ssize_t fastcom_write(fastcom_t h, const void *buf, size_t len) {
+    if (!h || h->data_fd < 0) return -EINVAL;
+    return write(h->data_fd, buf, len);
 }
 
-int fastcom_purge(fastcom_t dev, bool purge_tx, bool purge_rx)
-{
-    if (purge_tx) ioctl(dev->fscc_fd, FSCC_PURGE_TX);
-    if (purge_rx) ioctl(dev->fscc_fd, FSCC_PURGE_RX);
+ssize_t fastcom_read(fastcom_t h, void *buf, size_t len) {
+    if (!h || h->data_fd < 0) return -EINVAL;
+    return read(h->data_fd, buf, len);
+}
+
+int fastcom_purge(fastcom_t h, bool tx, bool rx) {
+    if (!h || h->sync_fd < 0) return -EINVAL;
+    if (tx) ioctl(h->sync_fd, FSCC_PURGE_TX);
+    if (rx) ioctl(h->sync_fd, FSCC_PURGE_RX);
     return 0;
 }
 
-int fastcom_set_memory_cap(fastcom_t dev, int input_frames, int output_frames)
-{
-    struct fscc_memory_cap cap = { input_frames, output_frames };
-    return ioctl(dev->fscc_fd, FSCC_SET_MEMORY_CAP, &cap);
+uint32_t fastcom_get_status(fastcom_t h) {
+    if (!h || h->sync_fd < 0) return 0;
+    struct fscc_registers regs = { .STAR = FSCC_UPDATE_VALUE };
+    ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs);
+    return regs.STAR;
 }
 
-/* Raw register access */
-int fastcom_get_registers(fastcom_t dev, struct fscc_registers *regs)
-{
-    FSCC_REGISTERS_INIT(*regs);
-    return ioctl(dev->fscc_fd, FSCC_GET_REGISTERS, regs);
+uint32_t fastcom_get_version(fastcom_t h) {
+    if (!h || h->sync_fd < 0) return 0;
+    struct fscc_registers regs = { .VSTR = FSCC_UPDATE_VALUE };
+    ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs);
+    return regs.VSTR;
 }
 
-int fastcom_set_registers(fastcom_t dev, const struct fscc_registers *regs)
-{
-    return ioctl(dev->fscc_fd, FSCC_SET_REGISTERS, regs);
+uint32_t fastcom_get_dma_status(fastcom_t h) {
+    if (!h || h->sync_fd < 0) return 0;
+    struct fscc_registers regs = { .DSTAR = FSCC_UPDATE_VALUE };
+    ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs);
+    return regs.DSTAR;
 }
 
-uint32_t fastcom_get_status(fastcom_t dev)
-{
-    uint32_t star = 0;
-    ioctl(dev->fscc_fd, FSCC_GET_STATUS, &star);
-    return star;
-}
-
-uint32_t fastcom_get_version(fastcom_t dev)
-{
-    struct fscc_registers regs;
-    fastcom_get_registers(dev, &regs);
-    return (uint32_t)regs.VSTR;
-}
-
-uint32_t fastcom_get_dma_status(fastcom_t dev)
-{
-    struct fscc_registers regs;
-    fastcom_get_registers(dev, &regs);
-    return (uint32_t)regs.DSTAR;
-}
-
-int fastcom_set_rts(fastcom_t dev, bool asserted)
-{
-    struct fscc_registers regs;
-    fastcom_get_registers(dev, &regs);
-    if (asserted)
-        regs.CCR1 |= FASTCOM_CCR1_RTSC | FASTCOM_CCR1_RTS;
-    else
-        regs.CCR1 = (regs.CCR1 & ~FASTCOM_CCR1_RTS) | FASTCOM_CCR1_RTSC;
-    return ioctl(dev->fscc_fd, FSCC_SET_REGISTERS, &regs);
-}
-
-int fastcom_get_cts(fastcom_t dev)
-{
-    return (fastcom_get_status(dev) & 0x00000020) ? 1 : 0;
-}
-
-int fastcom_enable_tx_frame_sync(fastcom_t dev, bool enable)
-{
-    struct fscc_registers regs;
-    fastcom_get_registers(dev, &regs);
-    if (enable)
-        regs.CCR0 = (regs.CCR0 & ~(0x7u << 8)) | (FASTCOM_FSC_MODE5_TX_ENABLE << 8);
-    else
-        regs.CCR0 &= ~(0x7u << 8);
-    return ioctl(dev->fscc_fd, FSCC_SET_REGISTERS, &regs);
-}
-
-void fastcom_close(fastcom_t dev)
-{
-    if (!dev) return;
-    if (dev->data_fd != dev->fscc_fd && dev->data_fd >= 0) close(dev->data_fd);
-    close(dev->fscc_fd);
-    free(dev);
+void fastcom_close(fastcom_t h) {
+    if (!h) return;
+    if (h->ctrl_fd >= 0) close(h->ctrl_fd);
+    if (h->data_fd >= 0 && h->data_fd != h->sync_fd) close(h->data_fd);
+    if (h->sync_fd >= 0) close(h->sync_fd);
+    free(h);
 }
