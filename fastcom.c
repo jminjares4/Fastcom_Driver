@@ -1,257 +1,181 @@
-/*
- * fastcom.c
- * COMPLETE USER-SPACE DRIVER FOR FASTCOM FSCC / SuperFSCC FAMILY
- * Properly handles sync_fd / data_fd / ctrl_fd separation
- * Runtime mode switching between sync and async/UART
- * No dependency on fscc_enable_async=1 at load time
- */
-
 #include "fastcom.h"
-#include "fastcom_defs.h"
-#include "calculate-clock-bits.h"
+#include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <termios.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
 #include <sys/ioctl.h>
-#include <serialfc.h>
+#include <string.h>
 
-struct fastcom_handle {
-    int port;
-    fastcom_mode_t mode;
-    int sync_fd;       // always /dev/fscc# — for FCR, purge, status
-    int data_fd;       // active read/write: fscc# (sync) or ttyS# (async)
-    int ctrl_fd;       // /dev/serialfc# — async extras only
+struct fastcom_port {
+    int fd;
+    unsigned number;
+    bool dma_enabled;
 };
 
-static int tty_number_for_port(int port) {
-    // Typical Commtech mapping — verify with dmesg | grep ttyS
-    // port 0 → ttyS4, port 1 → ttyS5, etc.
-    return 4 + port;
+fastcom_port_t* fastcom_open(unsigned port_number)
+{
+    char path[32];
+    fastcom_port_t* p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    sprintf(path, "/dev/fscc%u", port_number);
+    p->fd = open(path, O_RDWR);
+    if (p->fd < 0) { free(p); return NULL; }
+    p->number = port_number;
+    p->dma_enabled = false;
+    return p;
 }
 
-fastcom_t fastcom_open(int port, fastcom_mode_t initial_mode) {
-    if (port < 0 || port > 3) return NULL;
+void fastcom_close(fastcom_port_t* p) { if (p) { close(p->fd); free(p); } }
 
-    fastcom_t h = calloc(1, sizeof(*h));
-    if (!h) return NULL;
-
-    h->port = port;
-    h->mode = initial_mode;
-    h->sync_fd = h->data_fd = h->ctrl_fd = -1;
-
-    char path[64];
-
-    // Always open sync_fd — needed for mode control
-    sprintf(path, "/dev/fscc%d", port);
-    h->sync_fd = open(path, O_RDWR);
-    if (h->sync_fd < 0) {
-        perror("open /dev/fscc#");
-        goto fail;
-    }
-
-    // Set initial data path
-    if (initial_mode == FASTCOM_MODE_ASYNC_UART) {
-        sprintf(path, "/dev/ttyS%d", tty_number_for_port(port));
-        h->data_fd = open(path, O_RDWR | O_NOCTTY);
-        if (h->data_fd < 0) goto fail;
-
-        sprintf(path, "/dev/serialfc%d", port);
-        h->ctrl_fd = open(path, O_RDWR);
-        if (h->ctrl_fd < 0) goto fail;
-
-        // Ensure UART mode is active
-        fastcom_set_mode(h, FASTCOM_MODE_ASYNC_UART);
-    } else {
-        h->data_fd = h->sync_fd;
-    }
-
-    return h;
-
-fail:
-    fastcom_close(h);
-    return NULL;
+static int reg_get(fastcom_port_t* p, struct fscc_registers* r)
+{
+    FSCC_REGISTERS_INIT(*r);
+    return ioctl(p->fd, FSCC_GET_REGISTERS, r) == 0 ? 0 : -1;
 }
 
-int fastcom_set_mode(fastcom_t h, fastcom_mode_t new_mode) {
-    if (!h || h->mode == new_mode) return 0;
+static int reg_set(fastcom_port_t* p, struct fscc_registers* r)
+{
+    return ioctl(p->fd, FSCC_SET_REGISTERS, r) == 0 ? 0 : -1;
+}
 
-    char path[64];
+// ================================================================
+// COMMON CLOCK + STROBE
+// ================================================================
+static int apply_clock_strobe(fastcom_port_t* p, const fc_clock_strobe_t* cs)
+{
+    unsigned char bits[20];
+    if (calculate_clock_bits(cs->freq_hz, 10, bits) != 0) return -1;
+    ioctl(p->fd, FSCC_SET_CLOCK_BITS, bits);
 
-    // Close current async fds if switching away
-    if (h->mode == FASTCOM_MODE_ASYNC_UART) {
-        if (h->data_fd >= 0 && h->data_fd != h->sync_fd) close(h->data_fd);
-        if (h->ctrl_fd >= 0) close(h->ctrl_fd);
-        h->data_fd = -1;
-        h->ctrl_fd = -1;
-    }
+    struct fscc_registers r;
+    reg_get(p, &r);
+    r.CCR0 = (r.CCR0 & ~0x1C) | FC_CCR0_CLOCK_MODE_7;
+    r.CCR0 = (r.CCR0 & ~FC_FST_MODE_MASK) | (cs->fst_mode << 8);
+    r.CCR2 = (cs->rx_offset & 0xF) | ((cs->tx_lead_offset & 0xF)<<4) | ((cs->tx_trail_offset & 0xF)<<8);
 
-    // Update FCR via sync_fd
-    __u32 uart_bit = (h->port == 0) ? 0x01000000UL : 0x02000000UL;
-    struct fscc_registers regs = { .FCR = FSCC_UPDATE_VALUE };
+    if (p->number % 2 == 0) r.FCR &= ~FC_FCR_FSTDTRA;
+    else                    r.FCR &= ~FC_FCR_FSTDTRB;
 
-    if (ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs) < 0) {
-        perror("GET FCR");
-        return -1;
-    }
+    return reg_set(p, &r);
+}
 
-    if (new_mode == FASTCOM_MODE_ASYNC_UART) {
-        regs.FCR |= uart_bit;
-    } else {
-        regs.FCR &= ~uart_bit;
-    }
+// ================================================================
+// MODE SETUP – COMPLETE CONFIGURATION
+// ================================================================
+int fastcom_setup_hdlc(fastcom_port_t* p, const fc_hdlc_config_t* cfg)
+{
+    fastcom_set_mode(p, FC_MODE_HDLC);
+    apply_clock_strobe(p, &cfg->clock_strobe);
 
-    if (ioctl(h->sync_fd, FSCC_SET_REGISTERS, &regs) < 0) {
-        perror("SET FCR");
-        return -1;
-    }
+    struct fscc_registers r;
+    reg_get(p, &r);
 
-    // Purge after mode change
-    ioctl(h->sync_fd, FSCC_PURGE_RX);
-    ioctl(h->sync_fd, FSCC_PURGE_TX);
-    usleep(20000);
+    r.CCR0 = (r.CCR0 & ~0xE0) | cfg->encoding;
+    r.CCR0 = (r.CCR0 & ~0x300000) | (cfg->crc_mode << 20);
+    r.CCR0 = (r.CCR0 & ~(1u<<22)) | (cfg->bit_order << 22);
+    r.CCR0 = (r.CCR0 & ~(3u<<23)) | (cfg->address_mode << 23);
+    if (cfg->shared_flag) r.CCR0 |= FC_SHARED_FLAG_ENABLE;
 
-    // Open new path if going async
-    if (new_mode == FASTCOM_MODE_ASYNC_UART) {
-        sprintf(path, "/dev/ttyS%d", tty_number_for_port(h->port));
-        h->data_fd = open(path, O_RDWR | O_NOCTTY);
-        if (h->data_fd < 0) {
-            perror("open ttyS#");
-            return -1;
-        }
+    if (!cfg->rx_crc_check) r.CCR1 |= FC_DRCRC;
+    if (!cfg->tx_crc_insert) r.CCR1 |= FC_DTCRC;
 
-        sprintf(path, "/dev/serialfc%d", h->port);
-        h->ctrl_fd = open(path, O_RDWR);
-        if (h->ctrl_fd < 0) {
-            close(h->data_fd);
-            h->data_fd = -1;
-            perror("open serialfc#");
-            return -1;
-        }
-    } else {
-        h->data_fd = h->sync_fd;
-    }
+    r.SSR = cfg->ssr;
+    r.SMR = cfg->smr;
+    r.TSR = cfg->tsr;
+    r.TMR = cfg->tmr;
+    r.RAR = cfg->rar;
+    r.RAMR = cfg->ramr;
+    r.PPR = cfg->ppr;
+    r.TCR = cfg->tcr;
+    r.DPLLR = cfg->dpllr;
 
-    h->mode = new_mode;
+    return reg_set(p, &r);
+}
+
+int fastcom_setup_xsync(fastcom_port_t* p, const fc_xsync_config_t* cfg)
+{
+    fastcom_set_mode(p, FC_MODE_XSYNC);
+    apply_clock_strobe(p, &cfg->clock_strobe);
+
+    struct fscc_registers r;
+    reg_get(p, &r);
+    r.CCR0 = (r.CCR0 & ~FC_NSB_MASK) | (cfg->nsb << 13);
+    r.CCR0 = (r.CCR0 & ~FC_NTB_MASK) | (cfg->ntb << 16);
+    if (cfg->itf) r.CCR0 |= FC_ITF_SYNC;
+
+    r.SSR = cfg->ssr;
+    r.SMR = cfg->smr;
+    r.TSR = cfg->tsr;
+    r.TMR = cfg->tmr;
+
+    return reg_set(p, &r);
+}
+
+int fastcom_setup_transparent(fastcom_port_t* p, const fc_transparent_config_t* cfg)
+{
+    fastcom_set_mode(p, FC_MODE_TRANSPARENT);
+    apply_clock_strobe(p, &cfg->clock_strobe);
+
+    struct fscc_registers r;
+    reg_get(p, &r);
+    r.CCR2 = (r.CCR2 & ~0xFFFF0000u) | (cfg->rlc << 16);
+    return reg_set(p, &r);
+}
+
+int fastcom_setup_true_async(fastcom_port_t* p, const fc_true_async_config_t* cfg)
+{
+    fastcom_set_mode(p, FC_MODE_TRUE_ASYNC);
     return 0;
 }
 
-int fastcom_set_config(fastcom_t h, const fastcom_config_t *cfg) {
-    if (!h || !cfg) return -EINVAL;
+int fastcom_setup_transparent_async_framing(fastcom_port_t* p, const fc_transparent_async_framing_config_t* cfg)
+{
+    fastcom_set_mode(p, FC_MODE_TRANSPARENT);
+    apply_clock_strobe(p, &cfg->clock_strobe);
 
-    if (h->mode == FASTCOM_MODE_ASYNC_UART) {
-        struct termios tio;
-        if (tcgetattr(h->data_fd, &tio) < 0) return -1;
+    struct fscc_registers r;
+    reg_get(p, &r);
+    r.CCR2 = (r.CCR2 & ~0xFFFF0000u) | (cfg->rlc << 16);
+    return reg_set(p, &r);
+}
 
-        cfmakeraw(&tio);
-        tio.c_cflag &= ~(PARENB | PARODD | CSTOPB | CSIZE);
-        tio.c_cflag |= CREAD | CLOCAL;
+// ================================================================
+// SUPERFSCC DMA
+// ================================================================
+int fastcom_enable_dma(fastcom_port_t* p)
+{
+    struct fscc_registers r;
+    reg_get(p, &r);
+    r.DMACCR = FC_DMACCR_ENABLE;
+    p->dma_enabled = true;
+    return reg_set(p, &r);
+}
 
-        switch (cfg->data_bits) {
-            case 5: tio.c_cflag |= CS5; break;
-            case 6: tio.c_cflag |= CS6; break;
-            case 7: tio.c_cflag |= CS7; break;
-            default: tio.c_cflag |= CS8; break;
-        }
+int fastcom_set_memory_cap(fastcom_port_t* p, int input, int output)
+{
+    struct fscc_memory_cap cap = {input, output};
+    return ioctl(p->fd, FSCC_SET_MEMORY_CAP, &cap);
+}
 
-        if (cfg->parity == FASTCOM_PARITY_ODD)  tio.c_cflag |= PARENB | PARODD;
-        if (cfg->parity == FASTCOM_PARITY_EVEN) tio.c_cflag |= PARENB;
-        if (cfg->stop_bits == FASTCOM_STOP_BITS_2) tio.c_cflag |= CSTOPB;
+// ================================================================
+// I/O
+// ================================================================
+int fastcom_tx_frame(fastcom_port_t* p, const void* data, size_t len)
+{
+    return write(p->fd, data, len) == (ssize_t)len ? 0 : -1;
+}
 
-        speed_t baud = B9600;
-        if (cfg->baud_rate == 1000000) baud = B1000000;
-        else if (cfg->baud_rate == 115200) baud = B115200;
-        cfsetispeed(&tio, baud);
-        cfsetospeed(&tio, baud);
-
-        if (tcsetattr(h->data_fd, TCSANOW, &tio) < 0) return -1;
-
-        if (cfg->strobe_per_byte) {
-            ioctl(h->ctrl_fd, IOCTL_FASTCOM_SET_FRAME_LENGTH, 1);
-        }
-        if (cfg->aux_clock_hz > 0) {
-            unsigned char bits[20];
-            if (calculate_clock_bits(cfg->aux_clock_hz, 10, bits) == 0) {
-                ioctl(h->ctrl_fd, IOCTL_FASTCOM_SET_CLOCK_BITS, bits);
-            }
-        }
-    } else {
-        struct fscc_registers regs = {0};
-        regs.CCR0 = FSCC_UPDATE_VALUE;
-        if (ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs) < 0) return -1;
-
-        regs.CCR0 &= ~0x03;
-        switch (cfg->mode) {
-            case FASTCOM_MODE_HDLC:       regs.CCR0 |= 0x00; break;
-            case FASTCOM_MODE_XSYNC:      regs.CCR0 |= 0x01; break;
-            case FASTCOM_MODE_TRANSPARENT: regs.CCR0 |= 0x02; break;
-            default: break;
-        }
-
-        if (cfg->baud_rate > 0) {
-            unsigned char bits[20];
-            if (calculate_clock_bits(cfg->baud_rate, 10, bits) == 0) {
-                ioctl(h->sync_fd, FSCC_SET_CLOCK_BITS, bits);
-            }
-        }
-
-        if (cfg->strobe_per_byte && cfg->mode == FASTCOM_MODE_TRANSPARENT) {
-            regs.CCR0 = (regs.CCR0 & ~(0x7u << 8)) | (FASTCOM_FSC_MODE5_TX_ENABLE << 8);
-        }
-
-        if (ioctl(h->sync_fd, FSCC_SET_REGISTERS, &regs) < 0) return -1;
-
-        fastcom_purge(h, true, true);
+ssize_t fastcom_rx_frame(fastcom_port_t* p, void* buf, size_t max_len, bool wait)
+{
+    if (wait) {
+        fd_set set; FD_ZERO(&set); FD_SET(p->fd, &set);
+        select(p->fd+1, &set, NULL, NULL, NULL);
     }
+    return read(p->fd, buf, max_len);
+}
 
+int fastcom_purge(fastcom_port_t* p, bool tx, bool rx)
+{
+    if (tx) ioctl(p->fd, FSCC_PURGE_TX, 0);
+    if (rx) ioctl(p->fd, FSCC_PURGE_RX, 0);
     return 0;
-}
-
-ssize_t fastcom_write(fastcom_t h, const void *buf, size_t len) {
-    if (!h || h->data_fd < 0) return -EINVAL;
-    return write(h->data_fd, buf, len);
-}
-
-ssize_t fastcom_read(fastcom_t h, void *buf, size_t len) {
-    if (!h || h->data_fd < 0) return -EINVAL;
-    return read(h->data_fd, buf, len);
-}
-
-int fastcom_purge(fastcom_t h, bool tx, bool rx) {
-    if (!h || h->sync_fd < 0) return -EINVAL;
-    if (tx) ioctl(h->sync_fd, FSCC_PURGE_TX);
-    if (rx) ioctl(h->sync_fd, FSCC_PURGE_RX);
-    return 0;
-}
-
-uint32_t fastcom_get_status(fastcom_t h) {
-    if (!h || h->sync_fd < 0) return 0;
-    struct fscc_registers regs = { .STAR = FSCC_UPDATE_VALUE };
-    ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs);
-    return regs.STAR;
-}
-
-uint32_t fastcom_get_version(fastcom_t h) {
-    if (!h || h->sync_fd < 0) return 0;
-    struct fscc_registers regs = { .VSTR = FSCC_UPDATE_VALUE };
-    ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs);
-    return regs.VSTR;
-}
-
-uint32_t fastcom_get_dma_status(fastcom_t h) {
-    if (!h || h->sync_fd < 0) return 0;
-    struct fscc_registers regs = { .DSTAR = FSCC_UPDATE_VALUE };
-    ioctl(h->sync_fd, FSCC_GET_REGISTERS, &regs);
-    return regs.DSTAR;
-}
-
-void fastcom_close(fastcom_t h) {
-    if (!h) return;
-    if (h->ctrl_fd >= 0) close(h->ctrl_fd);
-    if (h->data_fd >= 0 && h->data_fd != h->sync_fd) close(h->data_fd);
-    if (h->sync_fd >= 0) close(h->sync_fd);
-    free(h);
 }
